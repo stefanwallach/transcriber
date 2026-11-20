@@ -1,0 +1,9 @@
+build/
+dist/
+__pycache__/
+*.spec
+*.tmp
+.env
+key.txt
+gemini_key.txt
+Transcriber.bat

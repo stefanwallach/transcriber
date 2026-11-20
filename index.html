@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transcriber Beta</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><img src="/icon.png" alt=""><span>Transcriber</span><span class="beta">Beta</span></div>
+    <button class="new-btn" id="newBtn"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>New transcription</button>
+    <div class="search">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input type="text" id="search" placeholder="Search transcripts" aria-label="Search transcripts">
+    </div>
+    <div class="side-scroll" id="sideScroll">
+      <div class="update" id="updateBox" hidden></div>
+      <div id="jobsBox" hidden><div class="group">In progress</div><div id="jobs"></div></div>
+      <nav class="folders" id="folders" aria-label="Folders"></nav>
+      <div class="lib-head"><span class="group" id="libHead">All transcripts</span><button class="link-btn" id="selectBtn">Select</button></div>
+      <div id="lib"></div>
+    </div>
+    <div class="selbar" id="selbar" hidden>
+      <span id="selCount">0 selected</span>
+      <div class="selbar-actions">
+        <button class="btn sm" id="selExport">Export</button>
+        <button class="btn sm" id="selMove">Move</button>
+        <button class="btn sm danger-outline" id="selDelete">Delete</button>
+        <button class="link-btn" id="selDone">Done</button>
+      </div>
+    </div>
+    <div class="side-foot">
+      <button id="settingsBtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>Settings</button>
+      <span class="credit" id="credit" title="Deepgram credit left"></span>
+    </div>
+  </aside>
+
+  <main>
+    <!-- New transcription -->
+    <section class="new" id="viewNew">
+      <div class="new-inner">
+        <h1>Transcribe a recording</h1>
+        <p class="lede">Add audio or video files, paste a link, or record from your microphone. Each transcript is saved here to edit, play back and export.</p>
+
+        <div class="keycard" id="keyCard" hidden>
+          <h2>Connect your Deepgram account</h2>
+          <p>Transcriber uses your own Deepgram API key. Create one at console.deepgram.com under API Keys, then paste it here. It's saved only on this computer.</p>
+          <div class="keyrow"><input type="password" id="keyInput" placeholder="Paste API key" aria-label="Deepgram API key"><button class="btn primary" id="keySave">Save key</button></div>
+        </div>
+
+        <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose files to transcribe">
+          <div class="wave" aria-hidden="true"><i style="height:16px"></i><i style="height:30px"></i><i style="height:44px"></i><i style="height:26px"></i><i style="height:38px"></i><i style="height:20px"></i><i style="height:32px"></i><i style="height:12px"></i></div>
+          <strong>Drop files here, or choose files</strong>
+          <span>MP3, WAV, M4A, MP4, MOV, MKV, WebM and more, up to 2 GB each</span>
+        </div>
+        <input type="file" id="picker" multiple accept="audio/*,video/*,.mkv,.flac,.ogg,.opus,.amr,.wma,.aac,.m4a" hidden>
+
+        <div class="alt-row">
+          <form class="linkbox" id="linkForm">
+            <label for="linkIn">Paste a link to an audio or video file</label>
+            <div class="keyrow"><input type="text" id="linkIn" placeholder="https://www.dropbox.com/… or a direct file link" spellcheck="false"><button class="btn" type="submit">Transcribe</button></div>
+            <span class="hint">Dropbox, Google Drive (shared with anyone who has the link) and direct file links work.</span>
+          </form>
+          <div class="recbox">
+            <label>Record from your microphone</label>
+            <button class="btn rec-btn" id="recStart"><span class="dot"></span>Start recording</button>
+            <span class="hint">The words appear as you speak.</span>
+          </div>
+        </div>
+
+        <div class="opts">
+          <div>
+            <h3>Recognition</h3>
+            <div class="field">
+              <label for="o-language">Language</label>
+              <select id="o-language">
+                <option value="en">English</option>
+                <option value="multi">English mixed with other languages</option>
+                <option value="auto">Detect automatically</option>
+                <option value="sw">Swahili</option>
+                <option value="fr">French</option>
+                <option value="es">Spanish</option>
+                <option value="pt">Portuguese</option>
+                <option value="de">German</option>
+                <option value="it">Italian</option>
+                <option value="nl">Dutch</option>
+                <option value="hi">Hindi</option>
+                <option value="ar">Arabic</option>
+                <option value="zh">Chinese</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="o-model">Model</label>
+              <select id="o-model">
+                <option value="nova-3">Nova-3, most accurate</option>
+                <option value="nova-2">Nova-2, more languages</option>
+              </select>
+              <span class="hint">If a language isn't accepted on Nova-3, try Nova-2.</span>
+            </div>
+            <div class="field">
+              <label for="o-folder">Save to folder</label>
+              <select id="o-folder"></select>
+            </div>
+            <div class="field">
+              <label for="o-keyterms">Names and terms to listen for</label>
+              <textarea id="o-keyterms" placeholder="One per line, for example&#10;Nairobi Chapel&#10;Deepgram"></textarea>
+              <span class="hint">Helps spell names, places and jargon correctly.</span>
+            </div>
+          </div>
+          <div>
+            <h3>Transcript</h3>
+            <label class="switch"><input type="checkbox" id="o-diarize"><span><b>Label speakers</b><small>Separate who said what</small></span></label>
+            <label class="switch"><input type="checkbox" id="o-summary"><span><b>Write a short summary</b><small>From Deepgram, English only. For chapters and notes, use Write-ups.</small></span></label>
+            <label class="switch"><input type="checkbox" id="o-filler"><span><b>Keep filler words</b><small>Include "um" and "uh"</small></span></label>
+            <label class="switch"><input type="checkbox" id="o-profanity"><span><b>Hide profanity</b><small>Mask swear words</small></span></label>
+            <label class="switch"><input type="checkbox" id="o-redact"><span><b>Hide personal details</b><small>Mask card numbers, ID numbers and other personal information</small></span></label>
+            <label class="switch"><input type="checkbox" id="o-keepMedia"><span><b>Keep the recording for playback</b><small>Saves a copy so you can listen while you edit</small></span></label>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Recording -->
+    <section class="rec" id="viewRec" hidden>
+      <div class="rec-head">
+        <div class="rec-state"><span class="dot live"></span><span id="recLabel">Recording</span></div>
+        <div class="rec-time" id="recTime">0:00</div>
+        <div class="meter" aria-hidden="true"><i id="recLevel"></i></div>
+        <select id="micSelect" aria-label="Microphone"></select>
+        <button class="btn" id="recDiscard">Discard</button>
+        <button class="btn primary" id="recStop">Stop and save</button>
+      </div>
+      <div class="rec-note" id="recNote" hidden></div>
+      <div class="rec-scroll" id="recScroll"><div class="page"><p class="rec-text" id="recText"><span class="interim">Start speaking…</span></p></div></div>
+      <div class="rec-foot">
+        <label class="switch"><input type="checkbox" id="recRedo"><span><b>When I stop, transcribe the recording again</b><small>The most accurate result, with paragraphs and speakers. Costs a second transcription.</small></span></label>
+      </div>
+    </section>
+
+    <!-- Transcript -->
+    <section class="doc" id="viewDoc" hidden>
+      <div class="doc-head">
+        <div class="t">
+          <input class="title-in" id="title" aria-label="Title">
+          <div class="meta" id="meta"></div>
+        </div>
+        <div class="tools">
+          <span class="save-state" id="saveState"></span>
+          <button class="icon-btn" id="undoBtn" title="Undo (Ctrl+Z)" disabled><svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/></svg></button>
+          <button class="icon-btn" id="redoBtn" title="Redo (Ctrl+Y)" disabled><svg viewBox="0 0 24 24"><path d="m15 14 5-5-5-5"/><path d="M20 9H9a5 5 0 0 0 0 10h3"/></svg></button>
+          <button class="icon-btn" id="findBtn" title="Find and replace (Ctrl+F)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></button>
+          <button class="icon-btn" id="markBtn" title="Add a bookmark (Ctrl+B)"><svg viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4-6 4z"/></svg></button>
+          <button class="icon-btn" id="copyBtn" title="Copy all text"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
+          <button class="btn primary" id="exportBtn"><svg viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>Export</button>
+          <button class="icon-btn" id="moreBtn" title="More"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></button>
+        </div>
+      </div>
+      <div class="tabs" role="tablist">
+        <button role="tab" class="tab on" data-tab="transcript">Transcript</button>
+        <button role="tab" class="tab" data-tab="writeups">Write-ups <span class="n" id="nWriteups"></span></button>
+        <button role="tab" class="tab" data-tab="bookmarks">Bookmarks <span class="n" id="nBookmarks"></span></button>
+      </div>
+      <div class="findbar" id="findbar" hidden>
+        <input type="text" id="findIn" placeholder="Find" aria-label="Find">
+        <span class="count" id="findCount"></span>
+        <button class="icon-btn" id="findPrev" title="Previous (Shift+Enter)"><svg viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"/></svg></button>
+        <button class="icon-btn" id="findNext" title="Next (Enter)"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></button>
+        <input type="text" id="replIn" placeholder="Replace with" aria-label="Replace with">
+        <button class="btn sm" id="replOne">Replace</button>
+        <button class="btn sm" id="replAll">Replace all</button>
+        <label><input type="checkbox" id="matchCase"> Match case</label>
+        <button class="icon-btn" id="findClose" title="Close (Esc)" style="margin-left:auto"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="doc-scroll" id="docScroll">
+        <div class="page" id="paneTranscript">
+          <div class="summary" id="summary" hidden><h4>Summary</h4><p id="summaryText"></p></div>
+          <div class="speakers" id="speakers" hidden></div>
+          <div id="segs"></div>
+        </div>
+        <div class="page" id="paneWriteups" hidden></div>
+        <div class="page" id="paneBookmarks" hidden></div>
+      </div>
+      <div class="video-box" id="videoBox" hidden>
+        <video id="media" preload="metadata" playsinline></video>
+        <button class="icon-btn" id="hideVideo" title="Hide video"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="player" id="player">
+        <button class="play" id="playBtn" title="Play (Ctrl+Space)"><svg viewBox="0 0 24 24" id="playIcon"><path d="M8 5v14l11-7z"/></svg></button>
+        <button class="icon-btn" id="back5" title="Back 5 seconds (Alt+Left)"><svg viewBox="0 0 24 24"><path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/></svg></button>
+        <button class="icon-btn" id="fwd5" title="Forward 5 seconds (Alt+Right)"><svg viewBox="0 0 24 24"><path d="m13 17 5-5-5-5M6 17l5-5-5-5"/></svg></button>
+        <span class="time" id="tNow">0:00</span>
+        <div class="scrub-wrap"><input type="range" class="scrub" id="scrub" min="0" max="1000" value="0" aria-label="Position"><div class="marks" id="marks"></div></div>
+        <span class="time" id="tDur">0:00</span>
+        <select id="rate" aria-label="Playback speed">
+          <option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option>
+          <option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option>
+        </select>
+        <label class="follow"><input type="checkbox" id="follow"> Follow along</label>
+        <button class="icon-btn" id="showVideo" title="Show video" hidden><svg viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="m16 10 5-3v10l-5-3"/></svg></button>
+      </div>
+      <div class="player" id="noPlayer" hidden><span class="no-media" id="noMediaMsg"></span></div>
+    </section>
+  </main>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div class="dropzone-overlay" id="dropOverlay" hidden><div>Drop to transcribe</div></div>
+<script src="/app.js"></script>
+</body>
+</html>
