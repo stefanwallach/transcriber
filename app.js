@@ -54,7 +54,7 @@ const isTyping = (el) => el && (el.matches?.("input, textarea, select") || el.cl
 /* ======================================================= preferences */
 const DEFAULTS = { language: "en", model: "nova-3", diarize: false, summary: false, filler: false, profanity: false,
   redact: false, keepMedia: true, keyterms: "", folder: "", stamps: false, speakersOut: true, writeupsOut: true,
-  follow: true, unsure: true, rate: "1", autoUpdate: true, folders: [], geminiModel: "", writeEnglish: false };
+  follow: true, unsure: true, rate: "1", autoUpdate: true, folders: [], geminiModel: "", writeEnglish: false, ytMode: "deepgram" };
 let prefs = { ...DEFAULTS };
 let status = {};
 const OPT_IDS = ["language", "model", "keyterms", "diarize", "summary", "filler", "profanity", "redact", "keepMedia", "folder"];
@@ -250,17 +250,63 @@ function addFiles(list, overrides) {
   }
   if (added) { renderJobs(); pump(); }
 }
-$("linkForm").onsubmit = (e) => {
+const YT = /^https?:\/\/([\w-]+\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)\//i;
+$("linkIn").oninput = () => {
+  const yt = YT.test($("linkIn").value.trim());
+  $("ytMode").hidden = !yt;
+  if (yt) document.querySelector(`input[name=ytm][value=${prefs.ytMode === "captions" ? "captions" : "deepgram"}]`).checked = true;
+};
+document.querySelectorAll("input[name=ytm]").forEach((r) => r.onchange = () => setPref("ytMode", r.value));
+$("linkForm").onsubmit = async (e) => {
   e.preventDefault();
-  if (needKey()) return;
   const url = $("linkIn").value.trim();
   if (!/^https?:\/\//i.test(url)) return toast("Paste a full link that starts with https://");
+  const captions = YT.test(url) && document.querySelector("input[name=ytm]:checked")?.value === "captions";
+  if (!captions && needKey()) return;
+  let info = {};
+  try { info = await req("GET", "/api/link-info?url=" + encodeURIComponent(url)); } catch { /* the job reports problems */ }
+  if (info.needsAddon && !(await ensureAddon())) return;
   let name = "Linked recording";
-  try { name = decodeURIComponent(new URL(url).pathname.split("/").pop()) || name; } catch { /* keep default */ }
-  jobs.push({ kind: "url", id: newId32(), name, url, opts: currentOpts(), status: "waiting", pct: 0 });
-  $("linkIn").value = "";
+  try {
+    const u = new URL(url);
+    name = info.kind === "web" ? (info.youtube ? "YouTube video" : u.hostname.replace(/^www\./, "") + " video")
+      : decodeURIComponent(u.pathname.split("/").pop()) || name;
+  } catch { /* keep default */ }
+  jobs.push({ kind: "url", id: newId32(), name, url, opts: { ...currentOpts(), captions }, status: "waiting", pct: 0 });
+  $("linkIn").value = ""; $("ytMode").hidden = true;
   renderJobs(); pump();
 };
+
+/* Web video support: yt-dlp + QuickJS, downloaded on first use */
+function ensureAddon() {
+  return new Promise((resolve) => {
+    let installing = false;
+    dialog(`<h2>Add web video support?</h2>
+      <p>To transcribe links from YouTube, Facebook, Instagram, TikTok and other sites, Transcriber needs two free, open-source tools: <b>yt-dlp</b>, which fetches the audio, and <b>QuickJS</b>, which yt-dlp uses for YouTube.</p>
+      <p class="hint">About 25 MB, downloaded from GitHub and checked against the published checksums. They keep themselves up to date. You can remove them in Settings.</p>
+      <div id="addonProg" hidden><div class="bar"><i style="width:0"></i></div><p class="hint" id="addonTxt" style="margin-top:6px">Downloading…</p></div>
+      <div class="end"><button class="btn" data-close>Not now</button><button class="btn primary" id="addonGo">Add web video support</button></div>`, (d) => {
+      d.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => { if (!installing) resolve(false); }));
+      d.querySelector("#addonGo").onclick = async () => {
+        installing = true;
+        d.querySelector("#addonGo").disabled = true;
+        d.querySelector("#addonProg").hidden = false;
+        await req("POST", "/api/addon/install").catch(() => {});
+        const poll = setInterval(async () => {
+          const a = await req("GET", "/api/addon").catch(() => null);
+          if (!a) return;
+          d.querySelector("#addonProg i").style.width = Math.round((a.pct || 0) * 100) + "%";
+          d.querySelector("#addonTxt").textContent = `Downloading… ${Math.round((a.pct || 0) * 100)}%`;
+          if (a.phase === "error") { clearInterval(poll); installing = false; toast(a.error, null, null, 8000); closeDialog(); resolve(false); }
+          if (a.installed && a.phase !== "downloading") {
+            clearInterval(poll); status.addon = { installed: true }; closeDialog();
+            toast("Web video support is ready"); resolve(true);
+          }
+        }, 400);
+      };
+    });
+  });
+}
 
 function probeDuration(file) {
   return new Promise((res) => {
@@ -281,7 +327,8 @@ function costRate() {
 }
 function estimateCost(seconds) { const r = costRate(); return seconds && r ? seconds * r : null; }
 
-const running = () => jobs.filter((j) => ["uploading", "processing", "downloading", "transcribing", "starting"].includes(j.status)).length;
+const ACTIVE = ["uploading", "processing", "downloading", "transcribing", "starting", "fetching", "captions"];
+const running = () => jobs.filter((j) => ACTIVE.includes(j.status)).length;
 function pump() {
   while (running() < MAX_PARALLEL) {
     const next = jobs.find((j) => j.status === "waiting");
@@ -334,9 +381,10 @@ async function runLink(job) {
     let s;
     try { s = await req("GET", "/api/jobs/" + job.id); } catch { return jobFailed(job, "Lost track of this transcription."); }
     if (s.phase === "done") return jobDone(job, s.doc);
-    if (s.phase === "error") return jobFailed(job, s.error);
+    if (s.phase === "error") { job.needsAddon = !!s.needsAddon; return jobFailed(job, s.error); }
     if (s.phase === "cancelled") return;
-    job.status = { downloading: "downloading", uploading: "uploading", transcribing: "processing" }[s.phase] || "starting";
+    job.status = { downloading: "downloading", uploading: "uploading", transcribing: "processing",
+      fetching: "fetching", captions: "captions" }[s.phase] || "starting";
     job.pct = s.pct || 0;
     if (job.status === "processing" && !job.t0) job.t0 = Date.now() - (s.elapsed || 0) * 1000;
     renderJobs();
@@ -345,7 +393,7 @@ async function runLink(job) {
   poll();
 }
 async function cancelJob(job) {
-  if (["uploading", "processing", "downloading", "starting"].includes(job.status)) {
+  if (ACTIVE.includes(job.status)) {
     job.status = "cancelled";
     await fetch("/api/cancel/" + job.id, { method: "POST" }).catch(() => {});
     job.xhr?.abort();
@@ -362,6 +410,8 @@ function renderJobs() {
     let state = "Waiting to start", bar = "";
     const est = job.estimate != null ? `, about ${money(job.estimate)}` : "";
     if (job.status === "starting") { state = "Opening the link"; bar = `<div class="bar indet"><i></i></div>`; }
+    if (job.status === "fetching") { state = "Looking up the video"; bar = `<div class="bar indet"><i></i></div>`; }
+    if (job.status === "captions") { state = "Getting the captions"; bar = `<div class="bar indet"><i></i></div>`; }
     if (job.status === "downloading") { state = job.pct ? `Downloading ${Math.round(job.pct * 100)}%` : "Downloading"; bar = job.pct ? `<div class="bar"><i style="width:${job.pct * 100}%"></i></div>` : `<div class="bar indet"><i></i></div>`; }
     if (job.status === "uploading") { state = `Uploading ${Math.round(job.pct * 100)}%${est}`; bar = `<div class="bar"><i style="width:${job.pct * 100}%"></i></div>`; }
     if (job.status === "processing") { state = `Transcribing, ${clock((Date.now() - (job.t0 || Date.now())) / 1000)}${est}`; bar = `<div class="bar indet"><i></i></div>`; }
@@ -370,8 +420,11 @@ function renderJobs() {
     el.innerHTML = `<div class="job-top"><div class="job-name" title="${esc(job.name)}">${esc(job.name)}</div>
       <button class="icon-btn" data-a="x" title="${job.status === "error" ? "Dismiss" : "Cancel"}">${ICON.x}</button></div>
       <div class="job-state ${job.status === "error" ? "err" : ""}">${esc(state)}</div>${bar}
-      ${job.status === "error" ? `<div class="job-actions"><button class="link-btn" data-a="retry">Try again</button></div>` : ""}`;
+      ${job.status === "error" ? `<div class="job-actions">${job.needsAddon ? `<button class="link-btn" data-a="addon">Add web video support</button>` : ""}<button class="link-btn" data-a="retry">Try again</button></div>` : ""}`;
     el.querySelector('[data-a="x"]').onclick = () => cancelJob(job);
+    el.querySelector('[data-a="addon"]')?.addEventListener("click", async () => {
+      if (await ensureAddon()) { job.status = "waiting"; job.needsAddon = false; job.id = newId32(); renderJobs(); pump(); }
+    });
     const retry = el.querySelector('[data-a="retry"]');
     if (retry) retry.onclick = () => { job.status = "waiting"; job.id = newId32(); job.t0 = 0; renderJobs(); pump(); };
     $("jobs").append(el);
@@ -550,8 +603,9 @@ function renderMeta() {
   if (doc.duration) bits.push(clock(doc.duration) + " long");
   bits.push(words.toLocaleString() + " words");
   if (doc.language) bits.push(LANGS[doc.language] || doc.language.toUpperCase());
+  if (doc.source && doc.sourceUrl) bits.push(doc.source.startsWith("YouTube captions") ? "From YouTube's captions" : "From " + doc.source);
   if (doc.folder) bits.push("In " + doc.folder);
-  if (doc.cost != null) bits.push("Cost " + money(doc.cost));
+  if (doc.cost) bits.push("Cost " + money(doc.cost));
   $("meta").innerHTML = bits.map((b) => `<span>${esc(b)}</span>`).join("");
   $("nWriteups").textContent = doc.writeups.length ? doc.writeups.length : "";
   $("nBookmarks").textContent = doc.bookmarks.length ? doc.bookmarks.length : "";
@@ -1137,6 +1191,7 @@ $("moreBtn").onclick = () => {
     { label: "Move to folder…", hint: doc.folder || "", fn: () => moveMenu($("moreBtn"), (f) => { doc.folder = f; scheduleSave(); flushSave().then(loadLibrary); toast(f ? `Moved to ${f}` : "Removed from folder"); }) },
     { label: prefs.unsure ? "Stop marking unsure words" : "Mark unsure words", fn: () => { setPref("unsure", !prefs.unsure); segsEl.classList.toggle("show-unsure", prefs.unsure); } },
   ];
+  if (doc.sourceUrl) items.push({ label: "Open the original link", fn: () => desktop()?.open_url ? desktop().open_url(doc.sourceUrl) : window.open(doc.sourceUrl, "_blank", "noopener") });
   if (desktop()?.open_library) items.push({ label: "Open library folder", fn: () => desktop().open_library() });
   items.push({ sep: true }, { label: "Delete transcript", danger: true, fn: deleteDoc });
   openMenu($("moreBtn"), items, null, true);
@@ -1165,6 +1220,9 @@ async function openSettings(focus) {
       ${status.hasGemini ? `<button class="btn" id="gKeyDel">Remove</button>` : ""}</div>
       <div class="field" style="margin-top:10px"><label for="gModel">Gemini model</label><select id="gModel">
         ${models.map((m, i) => `<option value="${m}">${m}${i === 0 ? " (fastest, cheapest)" : " (more thorough)"}</option>`).join("")}</select></div></section>
+    <section><h3>Web video support</h3>
+      <p class="hint" id="addonInfo">Checking…</p>
+      <div class="row" id="addonBtns"></div></section>
     <section><h3>Updates</h3>
       <label class="switch"><input type="checkbox" id="sAuto" ${prefs.autoUpdate ? "checked" : ""}><span><b>Check for updates when Transcriber opens</b></span></label>
       <div class="row"><button class="btn" id="sCheck">Check now</button><span class="hint">You have version ${esc(status.version || "")}.</span></div></section>
@@ -1203,6 +1261,22 @@ async function openSettings(focus) {
       d.querySelector("#sCheck").onclick = () => checkUpdates(true);
       d.querySelector("#sOpen")?.addEventListener("click", () => desktop().open_library());
       if (focus === "gemini") d.querySelector("#gKey").focus();
+      const renderAddon = async () => {
+        const a = await req("GET", "/api/addon").catch(() => ({}));
+        const info = d.querySelector("#addonInfo"), btns = d.querySelector("#addonBtns");
+        if (!info) return;
+        if (a.installed) {
+          info.textContent = `Installed. Links from YouTube, Facebook, TikTok and other sites work. yt-dlp version ${a.version || "unknown"}, updated automatically once a day.`;
+          btns.innerHTML = `<button class="btn" id="adUpd">Update now</button><button class="btn" id="adDel">Remove</button>`;
+          btns.querySelector("#adUpd").onclick = async (e) => { e.target.disabled = true; e.target.textContent = "Updating…"; const r = await req("POST", "/api/addon/update").catch(() => ({})); toast("yt-dlp is at version " + (r.version || "unknown")); renderAddon(); };
+          btns.querySelector("#adDel").onclick = async () => { await req("POST", "/api/addon/remove"); status.addon = { installed: false }; toast("Web video support removed"); renderAddon(); };
+        } else {
+          info.textContent = "Not installed. It's added the first time you paste a link from YouTube or another video site (about 25 MB).";
+          btns.innerHTML = `<button class="btn" id="adAdd">Add it now</button>`;
+          btns.querySelector("#adAdd").onclick = async () => { closeDialog(); if (await ensureAddon()) openSettings(); };
+        }
+      };
+      renderAddon();
     });
 }
 

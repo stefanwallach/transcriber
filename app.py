@@ -406,12 +406,313 @@ def cancel_job(job_id):
     if not state:
         return
     state["cancelled"] = True
+    proc = state.get("proc")
+    if proc is not None:
+        kill_tree(proc)
     conn = state.get("conn")
     if conn is not None and getattr(conn, "sock", None):
         try:
             conn.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+
+
+# ================================================================ web video support (yt-dlp add-on)
+
+TOOLS = CONFIG_DIR / "tools"
+YTDLP = TOOLS / "yt-dlp.exe"
+QJS = TOOLS / "qjs.exe"
+# QuickJS is the small JavaScript engine yt-dlp uses for YouTube's checks. Pinned, with its published digest.
+QJS_URL = "https://github.com/quickjs-ng/quickjs/releases/download/v0.18.0/qjs-windows-x86_64.exe"
+QJS_SHA256 = "ff03398d74ea6e6bd3a8e58058f7003225abcac229d7d57775b7aaae812a49c7"
+YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+YTDLP_SUMS = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS"
+ADDON = {"phase": "idle", "pct": 0, "error": None}
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+MEDIA_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus", ".wma", ".amr", ".aif", ".aiff",
+              ".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".wmv", ".mpg", ".mpeg", ".3gp", ".ts", ".mts")
+
+
+def addon_installed():
+    return YTDLP.exists() and QJS.exists()
+
+
+def addon_version():
+    if not addon_installed():
+        return None
+    try:
+        out = subprocess.run([str(YTDLP), "--version"], capture_output=True, text=True, timeout=30,
+                             creationflags=NO_WINDOW)
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def fetch_to(url, path, progress, base, share):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    sha = hashlib.sha256()
+    with urllib.request.urlopen(req, timeout=60) as r, open(path, "wb") as out:
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            out.write(chunk)
+            sha.update(chunk)
+            got += len(chunk)
+            if total:
+                progress(base + share * got / total)
+    return sha.hexdigest()
+
+
+def install_addon():
+    def work():
+        try:
+            ADDON.update(phase="downloading", pct=0, error=None)
+            TOOLS.mkdir(parents=True, exist_ok=True)
+            setp = lambda p: ADDON.__setitem__("pct", p)
+            sums = urllib.request.urlopen(urllib.request.Request(YTDLP_SUMS, headers={"User-Agent": UA}), timeout=30).read().decode()
+            want = next((l.split()[0] for l in sums.splitlines() if l.strip().endswith(" yt-dlp.exe")), None)
+            tmp = TOOLS / "yt-dlp.exe.download"
+            if fetch_to(YTDLP_URL, tmp, setp, 0, 0.92) != want:
+                tmp.unlink(missing_ok=True)
+                raise RuntimeError("The yt-dlp download didn't match its published checksum. Try again later.")
+            os.replace(tmp, YTDLP)
+            tmp = TOOLS / "qjs.exe.download"
+            if fetch_to(QJS_URL, tmp, setp, 0.92, 0.08) != QJS_SHA256:
+                tmp.unlink(missing_ok=True)
+                raise RuntimeError("The QuickJS download didn't match its published checksum. Try again later.")
+            os.replace(tmp, QJS)
+            (TOOLS / "last_update.txt").write_text(str(time.time()))
+            ADDON.update(phase="done", pct=1)
+        except Exception as e:
+            ADDON.update(phase="error", error="Couldn't install web video support: " + str(e))
+    threading.Thread(target=work, daemon=True).start()
+
+
+def update_addon(force=False):
+    """yt-dlp updates itself (it checks its own signature). Once a day is plenty."""
+    if not addon_installed():
+        return
+    stamp = TOOLS / "last_update.txt"
+    try:
+        last = float(stamp.read_text())
+    except (OSError, ValueError):
+        last = 0
+    if not force and time.time() - last < 86400:
+        return
+    try:
+        subprocess.run([str(YTDLP), "-U"], capture_output=True, timeout=180, creationflags=NO_WINDOW)
+        stamp.write_text(str(time.time()))
+    except Exception:
+        pass
+
+
+def kill_tree(proc):
+    """yt-dlp.exe unpacks itself and runs as a child process, so stop the whole tree."""
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=15,
+                       creationflags=NO_WINDOW)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def ytdlp(state, args, on_line=None):
+    cmd = [str(YTDLP), "--js-runtimes", f"quickjs:{QJS}", "--no-playlist", "--no-warnings",
+           "--encoding", "utf-8", "--socket-timeout", "30", *args]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    state["proc"] = p
+    lines = []
+    try:
+        for line in p.stdout:
+            if state["cancelled"]:
+                kill_tree(p)
+                raise Cancelled()
+            line = line.rstrip("\r\n")
+            lines.append(line)
+            if on_line:
+                on_line(line)
+        p.wait()
+    finally:
+        state["proc"] = None
+    if state["cancelled"]:
+        raise Cancelled()
+    return p.returncode, lines
+
+
+def ytdlp_error(lines):
+    text = "\n".join(l for l in lines if "ERROR" in l) or "\n".join(lines[-3:])
+    low = text.lower()
+    if "not a bot" in low:
+        return ("YouTube is asking to confirm you're not a robot, which happens after many requests from one "
+                "connection. Try again later, use YouTube's captions, or download the video and drop the file in.")
+    if "private" in low or "members-only" in low or "join this channel" in low:
+        return "This video is private or for members only, so it can't be fetched."
+    if any(k in low for k in ("logged-in", "log in", "login", "cookies", "sign in")):
+        return ("This site only shows the video to signed-in people, which Transcriber can't do. "
+                "Download the video yourself and drop the file in.")
+    if "unsupported url" in low:
+        return "Transcriber doesn't recognise a video on that page. Check the link points to a single video."
+    if "age" in low and "confirm" in low:
+        return "This video is age-restricted, so it can't be fetched without signing in."
+    if "is not available" in low or "unavailable" in low or "404" in low:
+        return "That video isn't available. It may have been removed, or be blocked in your country."
+    if "max-filesize" in low or "larger than max" in low:
+        return "This video's audio is over 2 GB."
+    m = re.search(r"ERROR:\s*(?:\[[^\]]+\]\s*)?(?:[\w-]+:\s*)?(.*)", text)
+    return "Couldn't fetch the video: " + (m.group(1).strip() if m else text.strip())[:300]
+
+
+def is_youtube(url):
+    host = urllib.parse.urlparse(url).netloc.lower()
+    return host.endswith("youtube.com") or host.endswith("youtu.be") or host.endswith("youtube-nocookie.com")
+
+
+def link_kind(url):
+    """'share' (cloud share link), 'direct' (a media file) or 'web' (a page yt-dlp reads)."""
+    host = urllib.parse.urlparse(url).netloc.lower()
+    path = urllib.parse.urlparse(url).path.lower()
+    if any(h in host for h in ("dropbox.com", "drive.google.com", "1drv.ms", "onedrive.live.com", "sharepoint.com")):
+        return "share"
+    if path.endswith(MEDIA_EXTS):
+        return "direct"
+    return "web"
+
+
+def download_web_video(state, url, folder, info_json=None):
+    """Fetch the best audio with yt-dlp. Returns (path, title, duration).
+    With info_json (saved by -J), yt-dlp skips looking the video up again."""
+    state["phase"] = "fetching"
+    info = {"title": None, "file": None, "dur": None}
+
+    def on_line(line):
+        if line.startswith("TITLE "):
+            info["title"] = line[6:].strip()
+            state["phase"] = "downloading"
+        elif line.startswith("DUR "):
+            try:
+                info["dur"] = float(line[4:])
+            except ValueError:
+                pass
+        elif line.startswith("FILE "):
+            info["file"] = line[5:].strip()
+        elif line.startswith("PCT "):
+            parts = line.split()
+            try:
+                got, total = float(parts[1]), float(parts[2])
+                if total > 0:
+                    state["phase"] = "downloading"
+                    state["pct"] = min(1.0, got / total)
+            except (ValueError, IndexError):
+                pass
+
+    def attempt(extra):
+        for p in folder.glob("media.*"):
+            p.unlink(missing_ok=True)
+        return ytdlp(state, [*extra, "-f", "bestaudio/best", "--max-filesize", "2G", "--newline", "--no-part",
+                             "--no-mtime", "--progress",
+                             "--progress-template", "download:PCT %(progress.downloaded_bytes)s %(progress.total_bytes,progress.total_bytes_estimate)s",
+                             "--print", "before_dl:TITLE %(title)s", "--print", "before_dl:DUR %(duration)s",
+                             "--print", "after_move:FILE %(filepath)s",
+                             "-o", str(folder / "media.%(ext)s"),
+                             *(["--load-info-json", str(info_json)] if info_json else [url])], on_line)
+
+    code, lines = attempt([])
+    if code != 0 and info_json:  # saved links can expire; look the video up again
+        info_json = None
+        code, lines = attempt([])
+    if code != 0 and is_youtube(url) and any("403" in l for l in lines):
+        code, lines = attempt(["--extractor-args", "youtube:player_client=mweb"])
+    if code != 0 or not info["file"] or not Path(info["file"]).exists():
+        raise DGError(ytdlp_error(lines))
+    return Path(info["file"]), info["title"] or "Web video", info["dur"]
+
+
+# ================================================================ YouTube captions
+
+def pick_caption_track(info, language):
+    subs, autos = info.get("subtitles") or {}, info.get("automatic_captions") or {}
+    video_lang = (info.get("language") or "").split("-")[0]
+    want = (video_lang or "en") if language in ("auto", "multi", "", None) else language
+    json3 = lambda tracks: next((t for t in tracks if t.get("ext") == "json3"), None)
+
+    def first(d, keys, auto):
+        for k in keys:
+            if k in d and json3(d[k]):
+                return json3(d[k]), k, auto
+        return None
+
+    same = lambda d, lang: [k for k in d if k.split("-")[0] == lang and k != "live_chat"]
+    return (first(subs, [want] + same(subs, want), False)
+            or first(autos, [f"{want}-orig"] + ([want] if video_lang in ("", want) else []), True)
+            or (first(subs, [video_lang] + same(subs, video_lang), False) if video_lang else None)
+            or first(autos, [k for k in autos if k.endswith("-orig")], True)
+            or first(autos, [want], True))
+
+
+def caption_words(j, auto):
+    events = [e for e in j.get("events", []) if e.get("segs")]
+    words = []
+    for i, e in enumerate(events):
+        base = e.get("tStartMs", 0) / 1000
+        end = base + e.get("dDurationMs", 0) / 1000
+        if auto:
+            for s in e["segs"]:
+                t = s.get("utf8", "").strip()
+                if t:
+                    words.append({"w": t, "s": base + s.get("tOffsetMs", 0) / 1000, "e": end, "c": 1})
+        else:  # hand-made captions: spread each line's words over its time
+            text = " ".join("".join(s.get("utf8", "") for s in e["segs"]).split())
+            parts = text.split()
+            span = max(end - base, 0.2)
+            for k, w in enumerate(parts):
+                words.append({"w": w, "s": base + span * k / len(parts), "e": base + span * (k + 1) / len(parts), "c": 1})
+    words.sort(key=lambda w: w["s"])
+    for a, b in zip(words, words[1:]):  # a word ends when the next starts (caption lines overlap)
+        a["e"] = max(a["s"] + 0.05, min(a["e"], b["s"]))
+    return [w for w in words if w["w"] not in ("[Music]", "[Applause]", "[Laughter]")]
+
+
+def run_captions_job(job_id, url, opts, state, folder):
+    state["phase"] = "fetching"
+    code, lines = ytdlp(state, ["-J", url])
+    raw = "\n".join(l for l in lines if l.startswith("{"))
+    if code != 0 or not raw:
+        raise DGError(ytdlp_error(lines))
+    info = json.loads(raw)
+    info_path = folder / "info.json"
+    info_path.write_text(raw, encoding="utf-8")
+    pick = pick_caption_track(info, opts.get("language"))
+    if not pick:
+        raise DGError("This video has no captions. Choose Transcribe with Deepgram instead.")
+    track, lang, auto = pick
+    state["phase"] = "captions"
+    j = json.loads(urllib.request.urlopen(urllib.request.Request(track["url"], headers={"User-Agent": "Mozilla/5.0"}),
+                                          timeout=60).read())
+    words = caption_words(j, auto)
+    if not words:
+        raise DGError("This video's captions are empty.")
+    media_name = None
+    if opts.get("keepMedia"):
+        state["phase"], state["pct"] = "downloading", 0
+        try:
+            path, _, _ = download_web_video(state, url, folder, info_path)
+            media_name = path.name
+        except DGError:
+            media_name = None  # captions still work without playback
+    info_path.unlink(missing_ok=True)
+    segs = finish_segments(chunk_words(words, False))
+    doc = new_doc(job_id, info.get("title") or "YouTube video", opts, media_name, segs, info.get("duration"),
+                  lang.split("-")[0])
+    doc["title"] = info.get("title") or "YouTube video"
+    doc.update(source="YouTube captions" + (" (automatic)" if auto else ""), sourceUrl=url, cost=0.0)
+    return doc
 
 
 # ================================================================ links
@@ -421,8 +722,12 @@ def normalize_link(url):
     if not re.match(r"https?://", url, re.I):
         raise DGError("Paste a full link that starts with https://")
     host = urllib.parse.urlparse(url).netloc.lower()
-    if any(h in host for h in ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "facebook.com")):
-        raise DGError("Links to YouTube and social media pages aren't supported. Use a direct link to an audio or video file.")
+    if "1drv.ms" in host or "onedrive.live.com" in host:
+        import base64
+        token = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+        return f"https://api.onedrive.com/v1.0/shares/u!{token}/root/content"
+    if "sharepoint.com" in host and "download=1" not in url:
+        return url + ("&" if "?" in url else "?") + "download=1"
     if "dropbox.com" in host:
         url = re.sub(r"([?&])dl=0", r"\1dl=1", url)
         if "dl=1" not in url:
@@ -442,72 +747,110 @@ def name_from_response(url, resp):
     return name or "Linked recording"
 
 
+class NeedsAddon(Exception):
+    pass
+
+
+def download_direct(state, url, folder):
+    """Fetch a file link. Returns (path, name, ctype) or None when the link is a web page."""
+    state["phase"] = "downloading"
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        raise DGError(f"The link didn't open (error {e.code}). Check it's shared with anyone who has the link.")
+    except Exception as e:
+        raise DGError("Couldn't open the link: " + str(e))
+    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if ctype.startswith("text/html"):
+        resp.close()
+        return None
+    name = name_from_response(resp.geturl() or url, resp)
+    ext = Path(name).suffix.lower()[:8] or mimetypes.guess_extension(ctype) or ".bin"
+    if not Path(name).suffix:
+        name += ext
+    total = int(resp.headers.get("Content-Length") or 0)
+    path = folder / f"media{ext}"
+    got = 0
+    with open(path, "wb") as out:
+        while True:
+            if state["cancelled"]:
+                raise Cancelled()
+            chunk = resp.read(1 << 16)
+            if not chunk:
+                break
+            out.write(chunk)
+            got += len(chunk)
+            if total:
+                state["pct"] = got / total
+            if got > 2 * 1024 ** 3:
+                raise DGError("This file is over 2 GB.")
+    resp.close()
+    if got == 0:
+        raise DGError("The link returned an empty file.")
+    return path, name, ctype
+
+
+def transcribe_local(state, key, path, name, opts, ctype=None):
+    state["phase"], state["pct"] = "uploading", 0
+    size = path.stat().st_size
+    with open(path, "rb") as f:
+        return deepgram_listen(state, key, dg_params(opts), TeeReader(f, size, None, state), size,
+                               mimetypes.guess_type(name)[0] or ctype or "application/octet-stream")
+
+
 def run_link_job(job_id, url, opts, state):
     folder = doc_dir(job_id)
     ok = False
     try:
-        key = get_key()
-        if not key:
-            raise DGError("Add your Deepgram API key in Settings first.")
-        url = normalize_link(url)
+        original = url.strip()
+        url = normalize_link(original)
         folder.mkdir(parents=True, exist_ok=True)
-        if opts.get("keepMedia"):
-            state["phase"] = "downloading"
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            try:
-                resp = urllib.request.urlopen(req, timeout=60)
-            except urllib.error.HTTPError as e:
-                raise DGError(f"The link didn't open (error {e.code}). Check it's shared publicly.")
-            except Exception as e:
-                raise DGError("Couldn't open the link: " + str(e))
-            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if ctype.startswith("text/html"):
-                raise DGError("That link opens a web page, not an audio or video file. Use a direct download link.")
-            name = name_from_response(url, resp)
-            ext = Path(name).suffix.lower()[:8] or mimetypes.guess_extension(ctype) or ".bin"
-            if not Path(name).suffix:
-                name += ext
-            total = int(resp.headers.get("Content-Length") or 0)
-            path = folder / f"media{ext}"
-            got = 0
-            with open(path, "wb") as out:
-                while True:
-                    if state["cancelled"]:
-                        raise Cancelled()
-                    chunk = resp.read(1 << 16)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    got += len(chunk)
-                    if total:
-                        state["pct"] = got / total
-                    if got > 2 * 1024 ** 3:
-                        raise DGError("This file is over 2 GB.")
-            resp.close()
-            if got == 0:
-                raise DGError("The link returned an empty file.")
-            state["phase"] = "uploading"
-            state["pct"] = 0
-            with open(path, "rb") as f:
-                dg = deepgram_listen(state, key, dg_params(opts), TeeReader(f, got, None, state), got,
-                                     mimetypes.guess_type(name)[0] or ctype or "application/octet-stream")
-            media_name = path.name
+        kind = link_kind(original)
+        if opts.get("captions") and is_youtube(original):
+            if not addon_installed():
+                raise NeedsAddon()
+            update_addon()
+            doc = run_captions_job(job_id, original, opts, state, folder)
         else:
-            state["phase"] = "transcribing"
-            state["t0"] = time.time()
-            body = json.dumps({"url": url}).encode()
-            dg = deepgram_listen(state, key, dg_params(opts), body, len(body), "application/json")
-            name = urllib.parse.unquote(Path(urllib.parse.urlparse(url).path).name) or "Linked recording"
-            media_name = None
-        doc = doc_from_deepgram(job_id, name, dg, opts, media_name)
-        write_json(folder / "raw.json", dg)
+            key = get_key()
+            if not key:
+                raise DGError("Add your Deepgram API key in Settings first.")
+            got = None
+            if kind != "web":
+                got = download_direct(state, url, folder)
+                if got is None and kind == "share":
+                    raise DGError('That link opens a sign-in or preview page, not the file. Share it with '
+                                  '"Anyone with the link" and try again.')
+            if got:
+                path, name, ctype = got
+            else:
+                if not addon_installed():
+                    raise NeedsAddon()
+                update_addon()
+                path, name, _ = download_web_video(state, original, folder)
+                ctype = None
+            dg = transcribe_local(state, key, path, name, opts, ctype)
+            media_name = path.name if opts.get("keepMedia") else None
+            if not media_name:
+                path.unlink(missing_ok=True)
+            write_json(folder / "raw.json", dg)
+            doc = doc_from_deepgram(job_id, name, dg, opts, media_name)
+            doc["sourceUrl"] = original
+            if not got:
+                doc["title"] = name  # a page title, not a file name: keep any dots in it
+                doc["source"] = urllib.parse.urlparse(original).netloc.replace("www.", "")
         save_doc(doc)
-        fetch_cost_later(job_id, doc.get("requestId"))
+        if doc.get("requestId"):
+            fetch_cost_later(job_id, doc["requestId"])
         state["doc"] = doc
         state["phase"] = "done"
         ok = True
     except Cancelled:
         state["phase"] = "cancelled"
+    except NeedsAddon:
+        state.update(phase="error", needsAddon=True,
+                     error="This link needs web video support, which isn't installed yet.")
     except DGError as e:
         state["phase"], state["error"] = "error", str(e)
     except Exception as e:
@@ -1101,7 +1444,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             return self.send_json(200, {"hasKey": bool(get_key()), "hasGemini": bool(get_key("gemini")),
                                         "version": VERSION, "library": str(LIBRARY), "frozen": FROZEN,
-                                        "geminiModels": GEMINI_MODELS})
+                                        "geminiModels": GEMINI_MODELS,
+                                        "addon": {"installed": addon_installed()}})
         if path == "/api/prefs":
             return self.send_json(200, prefs())
         if path == "/api/library":
@@ -1115,7 +1459,7 @@ class Handler(BaseHTTPRequestHandler):
                 st = JOBS.get(parts[2])
             if not st:
                 return self.send_json(404, {"error": "Unknown job"})
-            out = {k: st.get(k) for k in ("phase", "pct", "error", "doc")}
+            out = {k: st.get(k) for k in ("phase", "pct", "error", "doc", "needsAddon")}
             out["elapsed"] = time.time() - st.get("t0", time.time())
             if st["phase"] in ("done", "error", "cancelled"):
                 with JOBS_LOCK:
@@ -1166,6 +1510,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, check_update())
             except Exception as e:
                 return self.send_json(200, {"error": "Couldn't check for updates: " + str(e), "current": VERSION})
+        if path == "/api/addon":
+            return self.send_json(200, dict(ADDON, installed=addon_installed(), version=addon_version()))
+        if path == "/api/link-info":
+            url = (arg("url", "") or "").strip()
+            return self.send_json(200, {"kind": link_kind(url), "youtube": is_youtube(url),
+                                        "needsAddon": link_kind(url) == "web" and not addon_installed()})
         if path == "/api/update/status":
             return self.send_json(200, UPDATE)
         if parts[0] == "media" and len(parts) == 2 and safe_id(parts[1]):
@@ -1333,6 +1683,17 @@ class Handler(BaseHTTPRequestHandler):
                         doc["folder"] = new
                         save_doc(doc)
             return self.send_json(200, {"ok": True})
+        if path == "/api/addon/install":
+            if ADDON["phase"] != "downloading":
+                install_addon()
+            return self.send_json(200, {"ok": True})
+        if path == "/api/addon/update":
+            update_addon(force=True)
+            return self.send_json(200, {"version": addon_version()})
+        if path == "/api/addon/remove":
+            shutil.rmtree(TOOLS, ignore_errors=True)
+            ADDON.update(phase="idle", pct=0, error=None)
+            return self.send_json(200, {"ok": True})
         if path == "/api/update/install":
             if not FROZEN:
                 return self.send_json(400, {"error": "Updates install only in the installed app."})
@@ -1418,6 +1779,7 @@ def clean_opts(o):
             "diarize": truthy(o.get("diarize")), "filler": truthy(o.get("filler")),
             "profanity": truthy(o.get("profanity")), "redact": truthy(o.get("redact")),
             "summary": truthy(o.get("summary")), "keepMedia": o.get("keepMedia") in (None, "") or truthy(o.get("keepMedia")),
+            "captions": truthy(o.get("captions")),
             "folder": o.get("folder") or "",
             "keyterms": [t.strip() for t in terms if t and t.strip()][:100]}
 
@@ -1486,6 +1848,7 @@ def wait_for_saves():
 
 
 def main():
+    threading.Thread(target=update_addon, daemon=True).start()
     browser_mode = "--browser" in sys.argv
     server = ThreadingHTTPServer(("127.0.0.1", PORT if browser_mode else 0), Handler)
     server.daemon_threads = True

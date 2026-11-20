@@ -134,6 +134,11 @@ textarea { width: 100%; min-height: 92px; resize: vertical; }
 .linkbox, .recbox { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; display: grid; gap: 7px; align-content: start; }
 .linkbox label, .recbox label { font-weight: 600; }
 .rec-btn { justify-self: start; }
+.ytmode { display: grid; gap: 4px; padding: 4px 0 2px; }
+.radio { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; padding: 4px 0; font-weight: 400 !important; }
+.radio input { margin: 3px 0 0; accent-color: var(--accent); }
+.radio b { display: block; font-weight: 600; }
+.radio small { color: var(--muted); font-size: 12px; }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--rec); display: inline-block; }
 .opts { margin-top: 26px; display: grid; grid-template-columns: 1fr 1fr; gap: 22px 40px; }
 .opts h3 { margin: 0 0 10px; font-size: 13px; color: var(--muted); font-weight: 600; }

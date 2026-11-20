@@ -59,9 +59,13 @@
 
         <div class="alt-row">
           <form class="linkbox" id="linkForm">
-            <label for="linkIn">Paste a link to an audio or video file</label>
-            <div class="keyrow"><input type="text" id="linkIn" placeholder="https://www.dropbox.com/… or a direct file link" spellcheck="false"><button class="btn" type="submit">Transcribe</button></div>
-            <span class="hint">Dropbox, Google Drive (shared with anyone who has the link) and direct file links work.</span>
+            <label for="linkIn">Paste a link</label>
+            <div class="keyrow"><input type="text" id="linkIn" placeholder="A YouTube, Facebook or TikTok link, or a shared file" spellcheck="false"><button class="btn" type="submit">Transcribe</button></div>
+            <div class="ytmode" id="ytMode" hidden>
+              <label class="radio"><input type="radio" name="ytm" value="deepgram"><span><b>Transcribe with Deepgram</b><small>Most accurate, with speakers. Uses your Deepgram credit.</small></span></label>
+              <label class="radio"><input type="radio" name="ytm" value="captions"><span><b>Use YouTube's captions</b><small>Instant and free. Less accurate, no speakers.</small></span></label>
+            </div>
+            <span class="hint">Works with YouTube, Facebook, Instagram, TikTok, X, SoundCloud and many other sites, plus Dropbox, Google Drive and OneDrive links. Only transcribe videos you have permission to use.</span>
           </form>
           <div class="recbox">
             <label>Record from your microphone</label>
