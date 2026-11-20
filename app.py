@@ -546,9 +546,23 @@ def ytdlp(state, args, on_line=None):
     return p.returncode, lines
 
 
-def ytdlp_error(lines):
+def is_meta(url):
+    host = urllib.parse.urlparse(url).netloc.lower()
+    return any(h in host for h in ("facebook.com", "fb.watch", "fb.com", "instagram.com"))
+
+
+def needs_impersonation(url, lines):
+    """Facebook answers plain requests with pages yt-dlp can't read; looking like Chrome sometimes helps."""
+    low = "\n".join(lines).lower()
+    return is_meta(url) and ("cannot parse data" in low or "impersonat" in low or "403" in low)
+
+
+def ytdlp_error(lines, url=""):
     text = "\n".join(l for l in lines if "ERROR" in l) or "\n".join(lines[-3:])
     low = text.lower()
+    if is_meta(url) and ("cannot parse data" in low or "login" in low or "log in" in low):
+        return ("Facebook only shows this video to signed-in people, which Transcriber can't do. "
+                "Download the video yourself (or use Facebook's own download option) and drop the file in.")
     if "not a bot" in low:
         return ("YouTube is asking to confirm you're not a robot, which happens after many requests from one "
                 "connection. Try again later, use YouTube's captions, or download the video and drop the file in.")
@@ -629,8 +643,10 @@ def download_web_video(state, url, folder, info_json=None):
         code, lines = attempt([])
     if code != 0 and is_youtube(url) and any("403" in l for l in lines):
         code, lines = attempt(["--extractor-args", "youtube:player_client=mweb"])
+    if code != 0 and needs_impersonation(url, lines):
+        code, lines = attempt(["--impersonate", "chrome"])
     if code != 0 or not info["file"] or not Path(info["file"]).exists():
-        raise DGError(ytdlp_error(lines))
+        raise DGError(ytdlp_error(lines, url))
     return Path(info["file"]), info["title"] or "Web video", info["dur"]
 
 
@@ -684,7 +700,7 @@ def run_captions_job(job_id, url, opts, state, folder):
     code, lines = ytdlp(state, ["-J", url])
     raw = "\n".join(l for l in lines if l.startswith("{"))
     if code != 0 or not raw:
-        raise DGError(ytdlp_error(lines))
+        raise DGError(ytdlp_error(lines, url))
     info = json.loads(raw)
     info_path = folder / "info.json"
     info_path.write_text(raw, encoding="utf-8")
