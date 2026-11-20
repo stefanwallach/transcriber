@@ -109,6 +109,7 @@ def meta_for(doc):
         "duration": doc.get("duration"), "language": doc.get("language"),
         "words": len(text.split()), "hasMedia": bool(doc.get("media")),
         "folder": doc.get("folder") or "", "cost": doc.get("cost"),
+        "site": (doc.get("sourceInfo") or {}).get("site"), "uploader": (doc.get("sourceInfo") or {}).get("uploader"),
         "preview": text[:160],
     }
 
@@ -557,26 +558,58 @@ def needs_impersonation(url, lines):
     return is_meta(url) and ("cannot parse data" in low or "impersonat" in low or "403" in low)
 
 
+FIREFOX_PROFILES = Path(os.environ.get("APPDATA", "")) / "Mozilla" / "Firefox" / "Profiles"
+SITE_NAMES = {"youtube": "YouTube", "youtubetab": "YouTube", "facebook": "Facebook", "instagram": "Instagram",
+              "tiktok": "TikTok", "twitter": "X", "vimeo": "Vimeo", "soundcloud": "SoundCloud", "twitch": "Twitch",
+              "rumble": "Rumble", "linkedin": "LinkedIn", "dailymotion": "Dailymotion", "reddit": "Reddit"}
+# Speech transcribes as well from a ~50-80 kbps stream as from the best one, at well under half the size.
+AUDIO_FORMAT = "ba[abr<=80]/wa/ba/b"
+
+
+def firefox_available():
+    try:
+        return FIREFOX_PROFILES.exists() and any(FIREFOX_PROFILES.iterdir())
+    except OSError:
+        return False
+
+
+def use_firefox(url):
+    # Never for YouTube: signed-in downloads there can get the account flagged.
+    return bool(prefs().get("firefoxCookies")) and firefox_available() and not is_youtube(url)
+
+
+def is_login_wall(lines, url):
+    low = "\n".join(lines).lower()
+    return ((is_meta(url) and "cannot parse data" in low)
+            or any(k in low for k in ("logged-in", "log in", "login", "cookies", "sign in", "registered users")))
+
+
 def ytdlp_error(lines, url=""):
     text = "\n".join(l for l in lines if "ERROR" in l) or "\n".join(lines[-3:])
     low = text.lower()
-    if is_meta(url) and ("cannot parse data" in low or "login" in low or "log in" in low):
-        return ("Facebook only shows this video to signed-in people, which Transcriber can't do. "
-                "Download the video yourself (or use Facebook's own download option) and drop the file in.")
+    site = "Facebook" if "facebook" in url or "fb.watch" in url else "Instagram" if "instagram" in url else "This site"
+    if "firefox" in low and ("cookie" in low or "could not find" in low):
+        return "Couldn't read your Firefox sign-in. Open Firefox once, sign in to the site, then try again."
+    if is_login_wall(lines, url) or "private" in low:
+        if use_firefox(url):
+            return (f"{site} didn't show this video even with your Firefox sign-in. Check you can play it in "
+                    "Firefox, or download it yourself and drop the file in.")
+        if firefox_available() and not is_youtube(url):
+            return (f"{site} only shows this video to signed-in people. If you're signed in to {site if site != 'This site' else 'it'} "
+                    "in Firefox, turn on \"Use my Firefox sign-in\" in Settings. Or download the video yourself and drop the file in.")
+        return (f"{site} only shows this video to signed-in people, which Transcriber can't do here. "
+                "Download the video yourself and drop the file in.")
     if "not a bot" in low:
         return ("YouTube is asking to confirm you're not a robot, which happens after many requests from one "
                 "connection. Try again later, use YouTube's captions, or download the video and drop the file in.")
-    if "private" in low or "members-only" in low or "join this channel" in low:
-        return "This video is private or for members only, so it can't be fetched."
-    if any(k in low for k in ("logged-in", "log in", "login", "cookies", "sign in")):
-        return ("This site only shows the video to signed-in people, which Transcriber can't do. "
-                "Download the video yourself and drop the file in.")
+    if "members-only" in low or "join this channel" in low:
+        return "This video is for channel members only, so it can't be fetched."
     if "unsupported url" in low:
         return "Transcriber doesn't recognise a video on that page. Check the link points to a single video."
     if "age" in low and "confirm" in low:
         return "This video is age-restricted, so it can't be fetched without signing in."
-    if "is not available" in low or "unavailable" in low or "404" in low:
-        return "That video isn't available. It may have been removed, or be blocked in your country."
+    if "is not available" in low or "unavailable" in low or "404" in low or "blocked" in low:
+        return "That video isn't available here. It may have been removed, or be blocked in your country."
     if "max-filesize" in low or "larger than max" in low:
         return "This video's audio is over 2 GB."
     m = re.search(r"ERROR:\s*(?:\[[^\]]+\]\s*)?(?:[\w-]+:\s*)?(.*)", text)
@@ -599,9 +632,85 @@ def link_kind(url):
     return "web"
 
 
-def download_web_video(state, url, folder, info_json=None):
-    """Fetch the best audio with yt-dlp. Returns (path, title, duration).
-    With info_json (saved by -J), yt-dlp skips looking the video up again."""
+def ytdlp_tries(url, run):
+    """Run yt-dlp with fallbacks. run(extra) -> (code, lines). Returns (code, lines, extra that worked)."""
+    code, lines = run([])
+    if code == 0:
+        return code, lines, []
+    if is_youtube(url) and any("403" in l for l in lines):
+        extra = ["--extractor-args", "youtube:player_client=mweb"]
+        code, lines = run(extra)
+        if code == 0:
+            return code, lines, extra
+    imp = ["--impersonate", "chrome"] if is_meta(url) else []
+    if imp and needs_impersonation(url, lines):
+        code2, lines2 = run(imp)
+        if code2 == 0:
+            return code2, lines2, imp
+        code, lines = code2, lines2
+    if use_firefox(url) and is_login_wall(lines, url):
+        extra = [*imp, "--cookies-from-browser", "firefox"]
+        code, lines = run(extra)
+        if code == 0:
+            return code, lines, extra
+    return code, lines, None
+
+
+INFO_CACHE = {}  # url -> (time, saved json path, info, extra args that worked)
+
+
+def lookup_web(state, url):
+    """Look a video up (yt-dlp -J), reusing a lookup from the last 30 minutes."""
+    hit = INFO_CACHE.get(url)
+    if hit and time.time() - hit[0] < 1800 and hit[1].exists():
+        return hit[2], hit[1], hit[3]
+    state["phase"] = "fetching"
+    code, lines, extra = ytdlp_tries(url, lambda x: ytdlp(state, [*x, "-J", url]))
+    raw = next((l for l in lines if l.startswith("{")), None)
+    if code != 0 or not raw:
+        raise DGError(ytdlp_error(lines, url))
+    info = json.loads(raw)
+    if info.get("_type") == "playlist":
+        raise DGError("That's a playlist. Paste a link to a single video.")
+    if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
+        raise DGError("That's a live stream that hasn't finished. Transcribe it once it has ended.")
+    cache = TOOLS / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    path = cache / (hashlib.sha1(url.encode()).hexdigest() + ".json")
+    path.write_text(raw, encoding="utf-8")
+    INFO_CACHE[url] = (time.time(), path, info, extra or [])
+    return info, path, extra or []
+
+
+def summarize_info(info, url):
+    date = info.get("upload_date") or ""
+    subs, autos = info.get("subtitles") or {}, info.get("automatic_captions") or {}
+    fmts = [f for f in info.get("formats") or [] if f.get("acodec") not in (None, "none")]
+    audio = [f for f in fmts if f.get("vcodec") in (None, "none")]
+    small = [f for f in audio if (f.get("abr") or 999) <= 80]
+    pick = max(small, key=lambda f: f.get("abr") or 0) if small else (min(audio, key=lambda f: f.get("abr") or 999) if audio else None)
+    key = (info.get("extractor_key") or "").lower()
+    return {
+        "title": info.get("title") or info.get("fulltitle"),
+        "uploader": info.get("channel") or info.get("uploader") or info.get("creator"),
+        "uploaderUrl": info.get("channel_url") or info.get("uploader_url"),
+        "duration": info.get("duration"),
+        "date": f"{date[:4]}-{date[4:6]}-{date[6:]}" if len(date) == 8 else None,
+        "thumbnail": info.get("thumbnail"),
+        "url": info.get("webpage_url") or url,
+        "site": SITE_NAMES.get(key) or info.get("extractor_key") or urllib.parse.urlparse(url).netloc.replace("www.", ""),
+        "views": info.get("view_count"),
+        "description": (info.get("description") or "").strip()[:500],
+        "language": ((info.get("language") or "").split("-")[0]) or None,
+        "captions": {"manual": sorted({k.split("-")[0] for k in subs if k != "live_chat"}),
+                     "auto": sorted({k[:-5] for k in autos if k.endswith("-orig")})},
+        "audioSize": (pick or {}).get("filesize") or (pick or {}).get("filesize_approx"),
+    }
+
+
+def download_web_video(state, url, folder, info_path=None, extra0=None):
+    """Fetch a small audio stream with yt-dlp. Returns (path, title, duration).
+    With info_path (saved by -J), yt-dlp skips looking the video up again."""
     state["phase"] = "fetching"
     info = {"title": None, "file": None, "dur": None}
 
@@ -626,28 +735,38 @@ def download_web_video(state, url, folder, info_json=None):
             except (ValueError, IndexError):
                 pass
 
-    def attempt(extra):
-        for p in folder.glob("media.*"):
-            p.unlink(missing_ok=True)
-        return ytdlp(state, [*extra, "-f", "bestaudio/best", "--max-filesize", "2G", "--newline", "--no-part",
+    def attempt(extra, saved=None):
+        for f in folder.glob("media.*"):
+            f.unlink(missing_ok=True)
+        return ytdlp(state, [*extra, "-f", AUDIO_FORMAT, "--max-filesize", "2G", "--newline", "--no-part",
                              "--no-mtime", "--progress",
                              "--progress-template", "download:PCT %(progress.downloaded_bytes)s %(progress.total_bytes,progress.total_bytes_estimate)s",
                              "--print", "before_dl:TITLE %(title)s", "--print", "before_dl:DUR %(duration)s",
                              "--print", "after_move:FILE %(filepath)s",
                              "-o", str(folder / "media.%(ext)s"),
-                             *(["--load-info-json", str(info_json)] if info_json else [url])], on_line)
+                             *(["--load-info-json", str(saved)] if saved else [url])], on_line)
 
-    code, lines = attempt([])
-    if code != 0 and info_json:  # saved links can expire; look the video up again
-        info_json = None
-        code, lines = attempt([])
-    if code != 0 and is_youtube(url) and any("403" in l for l in lines):
-        code, lines = attempt(["--extractor-args", "youtube:player_client=mweb"])
-    if code != 0 and needs_impersonation(url, lines):
-        code, lines = attempt(["--impersonate", "chrome"])
+    code, lines = (attempt(extra0 or [], info_path) if info_path else (1, []))
+    if code != 0:  # no saved lookup, or its links expired: look the video up again
+        INFO_CACHE.pop(url, None)
+        code, lines, _ = ytdlp_tries(url, attempt)
     if code != 0 or not info["file"] or not Path(info["file"]).exists():
         raise DGError(ytdlp_error(lines, url))
     return Path(info["file"]), info["title"] or "Web video", info["dur"]
+
+
+def save_thumbnail(doc, thumb_url):
+    if not thumb_url or not thumb_url.startswith("https://"):
+        return
+    try:
+        req = urllib.request.Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = r.read(3 * 1024 * 1024)
+        if data[:3] == b"\xff\xd8\xff" or data[:4] in (b"\x89PNG", b"RIFF"):
+            (doc_dir(doc["id"]) / "thumb.img").write_bytes(data)
+            doc["thumb"] = True
+    except Exception:
+        pass
 
 
 # ================================================================ YouTube captions
@@ -675,17 +794,16 @@ def pick_caption_track(info, language):
 def caption_words(j, auto):
     events = [e for e in j.get("events", []) if e.get("segs")]
     words = []
-    for i, e in enumerate(events):
+    for e in events:
         base = e.get("tStartMs", 0) / 1000
         end = base + e.get("dDurationMs", 0) / 1000
         if auto:
-            for s in e["segs"]:
-                t = s.get("utf8", "").strip()
+            for sg in e["segs"]:
+                t = sg.get("utf8", "").strip()
                 if t:
-                    words.append({"w": t, "s": base + s.get("tOffsetMs", 0) / 1000, "e": end, "c": 1})
+                    words.append({"w": t, "s": base + sg.get("tOffsetMs", 0) / 1000, "e": end, "c": 1})
         else:  # hand-made captions: spread each line's words over its time
-            text = " ".join("".join(s.get("utf8", "") for s in e["segs"]).split())
-            parts = text.split()
+            parts = " ".join("".join(sg.get("utf8", "") for sg in e["segs"]).split()).split()
             span = max(end - base, 0.2)
             for k, w in enumerate(parts):
                 words.append({"w": w, "s": base + span * k / len(parts), "e": base + span * (k + 1) / len(parts), "c": 1})
@@ -696,14 +814,7 @@ def caption_words(j, auto):
 
 
 def run_captions_job(job_id, url, opts, state, folder):
-    state["phase"] = "fetching"
-    code, lines = ytdlp(state, ["-J", url])
-    raw = "\n".join(l for l in lines if l.startswith("{"))
-    if code != 0 or not raw:
-        raise DGError(ytdlp_error(lines, url))
-    info = json.loads(raw)
-    info_path = folder / "info.json"
-    info_path.write_text(raw, encoding="utf-8")
+    info, info_path, extra = lookup_web(state, url)
     pick = pick_caption_track(info, opts.get("language"))
     if not pick:
         raise DGError("This video has no captions. Choose Transcribe with Deepgram instead.")
@@ -718,17 +829,52 @@ def run_captions_job(job_id, url, opts, state, folder):
     if opts.get("keepMedia"):
         state["phase"], state["pct"] = "downloading", 0
         try:
-            path, _, _ = download_web_video(state, url, folder, info_path)
+            path, _, _ = download_web_video(state, url, folder, info_path, extra)
             media_name = path.name
         except DGError:
             media_name = None  # captions still work without playback
-    info_path.unlink(missing_ok=True)
     segs = finish_segments(chunk_words(words, False))
-    doc = new_doc(job_id, info.get("title") or "YouTube video", opts, media_name, segs, info.get("duration"),
+    summary = summarize_info(info, url)
+    doc = new_doc(job_id, summary["title"] or "YouTube video", opts, media_name, segs, info.get("duration"),
                   lang.split("-")[0])
-    doc["title"] = info.get("title") or "YouTube video"
-    doc.update(source="YouTube captions" + (" (automatic)" if auto else ""), sourceUrl=url, cost=0.0)
+    doc["title"] = summary["title"] or "YouTube video"
+    doc.update(source="YouTube captions" + (" (automatic)" if auto else ""), sourceUrl=url, cost=0.0,
+               sourceInfo=summary)
+    save_thumbnail(doc, summary.get("thumbnail"))
     return doc
+
+
+def preview_link(state, url):
+    """What the person sees before transcribing a link."""
+    kind = link_kind(url)
+    out = {"kind": kind, "youtube": is_youtube(url)}
+    if kind == "web":
+        if not addon_installed():
+            return dict(out, needsAddon=True)
+        update_addon()
+        info, _, _ = lookup_web(state, url)
+        return dict(out, info=summarize_info(info, url))
+    target = normalize_link(url)
+    req = urllib.request.Request(target, headers={"User-Agent": UA, "Range": "bytes=0-0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype.startswith("text/html"):
+                raise DGError('That link opens a sign-in or preview page, not the file. Share it with '
+                              '"Anyone with the link" and try again.')
+            total = r.headers.get("Content-Range", "").rpartition("/")[2] or r.headers.get("Content-Length")
+            name = name_from_response(r.geturl() or target, r)
+    except urllib.error.HTTPError as e:
+        raise DGError(f"The link didn't open (error {e.code}). Check it's shared with anyone who has the link.")
+    except DGError:
+        raise
+    except Exception as e:
+        raise DGError("Couldn't open the link: " + str(e))
+    host = urllib.parse.urlparse(url).netloc.replace("www.", "")
+    site = {"dropbox.com": "Dropbox", "drive.google.com": "Google Drive", "1drv.ms": "OneDrive",
+            "onedrive.live.com": "OneDrive"}.get(host, "SharePoint" if "sharepoint.com" in host else host)
+    return dict(out, info={"title": name, "site": site, "url": url,
+                           "size": int(total) if str(total).isdigit() else None, "type": ctype})
 
 
 # ================================================================ links
@@ -832,7 +978,7 @@ def run_link_job(job_id, url, opts, state):
             key = get_key()
             if not key:
                 raise DGError("Add your Deepgram API key in Settings first.")
-            got = None
+            got, summary = None, None
             if kind != "web":
                 got = download_direct(state, url, folder)
                 if got is None and kind == "share":
@@ -844,7 +990,10 @@ def run_link_job(job_id, url, opts, state):
                 if not addon_installed():
                     raise NeedsAddon()
                 update_addon()
-                path, name, _ = download_web_video(state, original, folder)
+                info, info_path, extra = lookup_web(state, original)
+                summary = summarize_info(info, original)
+                path, name, _ = download_web_video(state, original, folder, info_path, extra)
+                name = summary["title"] or name
                 ctype = None
             dg = transcribe_local(state, key, path, name, opts, ctype)
             media_name = path.name if opts.get("keepMedia") else None
@@ -853,9 +1002,11 @@ def run_link_job(job_id, url, opts, state):
             write_json(folder / "raw.json", dg)
             doc = doc_from_deepgram(job_id, name, dg, opts, media_name)
             doc["sourceUrl"] = original
-            if not got:
+            if summary:
                 doc["title"] = name  # a page title, not a file name: keep any dots in it
-                doc["source"] = urllib.parse.urlparse(original).netloc.replace("www.", "")
+                doc["source"] = summary["site"]
+                doc["sourceInfo"] = summary
+                save_thumbnail(doc, summary.get("thumbnail"))
         save_doc(doc)
         if doc.get("requestId"):
             fetch_cost_later(job_id, doc["requestId"])
@@ -1461,7 +1612,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, {"hasKey": bool(get_key()), "hasGemini": bool(get_key("gemini")),
                                         "version": VERSION, "library": str(LIBRARY), "frozen": FROZEN,
                                         "geminiModels": GEMINI_MODELS,
-                                        "addon": {"installed": addon_installed()}})
+                                        "addon": {"installed": addon_installed()},
+                                        "firefox": firefox_available()})
         if path == "/api/prefs":
             return self.send_json(200, prefs())
         if path == "/api/library":
@@ -1534,6 +1686,13 @@ class Handler(BaseHTTPRequestHandler):
                                         "needsAddon": link_kind(url) == "web" and not addon_installed()})
         if path == "/api/update/status":
             return self.send_json(200, UPDATE)
+        if parts[0] == "thumb" and len(parts) == 2 and safe_id(parts[1]):
+            p = doc_dir(parts[1]) / "thumb.img"
+            if not p.exists():
+                return self.send_json(404, {"error": "No picture"})
+            data = p.read_bytes()
+            ctype = "image/png" if data[:4] == b"\x89PNG" else "image/webp" if data[:4] == b"RIFF" else "image/jpeg"
+            return self.send_bytes(200, data, ctype)
         if parts[0] == "media" and len(parts) == 2 and safe_id(parts[1]):
             return self.serve_media(parts[1])
         self.send_json(404, {"error": "Not found"})
@@ -1661,6 +1820,21 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=run_link_job, args=(job_id, data.get("url", ""), clean_opts(data.get("opts") or {}), state),
                              daemon=True).start()
             return self.send_json(200, {"id": job_id})
+        if path == "/api/link-preview":
+            data = self.body_json()
+            job_id = safe_id(data.get("id")) or uuid.uuid4().hex
+            state = register_job(job_id, "fetching")
+            try:
+                return self.send_json(200, preview_link(state, (data.get("url") or "").strip()))
+            except Cancelled:
+                return self.send_json(499, {"error": "Cancelled", "cancelled": True})
+            except DGError as e:
+                return self.send_json(502, {"error": str(e)})
+            except Exception as e:
+                return self.send_json(502, {"error": "Couldn't look the link up: " + str(e)})
+            finally:
+                with JOBS_LOCK:
+                    JOBS.pop(job_id, None)
         if path == "/api/live/save":
             return self.live_save(self.body_json())
         if path == "/api/writeup":

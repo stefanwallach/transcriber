@@ -250,32 +250,104 @@ function addFiles(list, overrides) {
   }
   if (added) { renderJobs(); pump(); }
 }
-const YT = /^https?:\/\/([\w-]+\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)\//i;
-$("linkIn").oninput = () => {
-  const yt = YT.test($("linkIn").value.trim());
-  $("ytMode").hidden = !yt;
-  if (yt) document.querySelector(`input[name=ytm][value=${prefs.ytMode === "captions" ? "captions" : "deepgram"}]`).checked = true;
-};
-document.querySelectorAll("input[name=ytm]").forEach((r) => r.onchange = () => setPref("ytMode", r.value));
+/* ---- link preview: look the link up, show what it is, then transcribe */
+const FILE_ICON = '<svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
+const LANG_NAME = (code) => { try { return new Intl.DisplayNames(["en"], { type: "language" }).of(code); } catch { return code; } };
+const fmtDate = (iso) => iso ? new Date(iso + "T12:00:00").toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" }) : "";
+const fmtSize = (b) => !b ? "" : b > 1e9 ? (b / 1e9).toFixed(1) + " GB" : b > 1e6 ? Math.round(b / 1e6) + " MB" : Math.max(1, Math.round(b / 1e3)) + " KB";
+const fmtViews = (n) => n == null ? "" : n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M views" : n >= 1e3 ? Math.round(n / 1e3) + "K views" : n + " views";
+function captionsText(c, lang) {
+  if (!c) return "";
+  const first = (a) => lang && a.includes(lang) ? [lang, ...a.filter((x) => x !== lang)] : a;
+  const man = first(c.manual || []).map(LANG_NAME), auto = first(c.auto || []).map(LANG_NAME);
+  if (man.length) return `Captions by the uploader in ${man.slice(0, 4).join(", ")}${man.length > 4 ? ` and ${man.length - 4} more` : ""}` + (auto.length ? `, plus automatic ${auto.join(", ")}` : "");
+  if (auto.length) return `Automatic captions in ${auto.join(", ")}`;
+  return "No captions";
+}
+const openExternal = (url) => desktop()?.open_url ? desktop().open_url(url) : window.open(url, "_blank", "noopener");
+let preview = null; // { id, url, data }
+function setPreview(html) { const box = $("linkPreview"); box.hidden = !html; box.innerHTML = html || ""; $("linkHint").hidden = !!html; }
+async function cancelPreview() {
+  if (preview?.loading) fetch("/api/cancel/" + preview.id, { method: "POST" }).catch(() => {});
+  preview = null; setPreview("");
+}
+$("linkIn").oninput = () => { if (preview && !preview.loading) cancelPreview(); };
 $("linkForm").onsubmit = async (e) => {
   e.preventDefault();
   const url = $("linkIn").value.trim();
   if (!/^https?:\/\//i.test(url)) return toast("Paste a full link that starts with https://");
-  const captions = YT.test(url) && document.querySelector("input[name=ytm]:checked")?.value === "captions";
-  if (!captions && needKey()) return;
-  let info = {};
-  try { info = await req("GET", "/api/link-info?url=" + encodeURIComponent(url)); } catch { /* the job reports problems */ }
-  if (info.needsAddon && !(await ensureAddon())) return;
-  let name = "Linked recording";
+  if (preview?.loading) return;
+  let kind = {};
+  try { kind = await req("GET", "/api/link-info?url=" + encodeURIComponent(url)); } catch { /* the lookup reports problems */ }
+  if (kind.needsAddon && !(await ensureAddon())) return;
+  const p = preview = { id: newId32(), url, loading: true };
+  setPreview(`<div class="lp"><div class="lp-foot"><span class="hint">Looking up the link… ${kind.kind === "web" ? "This takes a few seconds." : ""}</span><button class="btn sm" type="button" id="lpCancel">Cancel</button></div><div class="bar indet"><i></i></div></div>`);
+  $("lpCancel").onclick = cancelPreview;
   try {
-    const u = new URL(url);
-    name = info.kind === "web" ? (info.youtube ? "YouTube video" : u.hostname.replace(/^www\./, "") + " video")
-      : decodeURIComponent(u.pathname.split("/").pop()) || name;
-  } catch { /* keep default */ }
-  jobs.push({ kind: "url", id: newId32(), name, url, opts: { ...currentOpts(), captions }, status: "waiting", pct: 0 });
-  $("linkIn").value = ""; $("ytMode").hidden = true;
-  renderJobs(); pump();
+    p.data = await req("POST", "/api/link-preview", { id: p.id, url });
+  } catch (err) {
+    if (preview !== p) return;
+    p.loading = false;
+    setPreview(`<div class="lp"><div class="lp-err">${esc(err.message)}</div><div class="lp-foot"><span class="hint"></span><button class="btn sm" type="button" id="lpCancel">Close</button><button class="btn sm" type="button" id="lpRetry">Try again</button></div></div>`);
+    $("lpCancel").onclick = cancelPreview;
+    $("lpRetry").onclick = () => $("linkForm").requestSubmit();
+    return;
+  }
+  if (preview !== p) return;
+  p.loading = false;
+  if (p.data.needsAddon) { if (await ensureAddon()) $("linkForm").requestSubmit(); else cancelPreview(); return; }
+  renderPreview(p);
 };
+function renderPreview(p) {
+  const d = p.data, i = d.info || {};
+  const isWeb = d.kind === "web";
+  const meta = [];
+  if (i.uploader) meta.push(`<b>${esc(i.uploader)}</b>`);
+  if (i.duration) meta.push(esc(clock(i.duration)));
+  if (i.date) meta.push("Uploaded " + esc(fmtDate(i.date)));
+  if (i.views != null) meta.push(esc(fmtViews(i.views)));
+  if (i.site) meta.push(esc(i.site));
+  if (!isWeb && i.size) meta.push(esc(fmtSize(i.size)));
+  const capText = d.youtube ? captionsText(i.captions, i.language) : "";
+  const hasCaps = d.youtube && ((i.captions?.manual || []).length || (i.captions?.auto || []).length);
+  const est = estimateCost(i.duration);
+  const mode = hasCaps && prefs.ytMode === "captions" ? "captions" : "deepgram";
+  setPreview(`<div class="lp">
+    <div class="lp-top">
+      ${i.thumbnail ? `<img class="lp-thumb" src="${esc(i.thumbnail)}" alt="" referrerpolicy="no-referrer">` : `<div class="lp-file">${FILE_ICON}</div>`}
+      <div class="lp-body">
+        <div class="lp-title" title="${esc(i.title)}">${esc(i.title || "Untitled")}</div>
+        <div class="lp-meta">${meta.map((m) => `<span>${m}</span>`).join("")}</div>
+        ${capText ? `<div class="lp-caps">${esc(capText)}</div>` : ""}
+        <div class="lp-links"><button class="link-btn" type="button" data-a="open">Open link</button>
+          ${i.uploaderUrl ? `<button class="link-btn" type="button" data-a="chan">Open channel</button>` : ""}
+          ${i.description ? `<button class="link-btn" type="button" data-a="desc">Show description</button>` : ""}</div>
+      </div>
+    </div>
+    ${i.description ? `<div class="lp-desc" hidden>${esc(i.description)}</div>` : ""}
+    ${d.youtube ? `<div class="ytmode">
+      <label class="radio"><input type="radio" name="ytm" value="deepgram" ${mode === "deepgram" ? "checked" : ""}><span><b>Transcribe with Deepgram</b><small>Most accurate, with speakers. Uses your Deepgram credit${est != null ? `, about ${money(est)}` : ""}.</small></span></label>
+      <label class="radio" ${hasCaps ? "" : 'style="opacity:.5"'}><input type="radio" name="ytm" value="captions" ${mode === "captions" ? "checked" : ""} ${hasCaps ? "" : "disabled"}><span><b>Use YouTube's captions</b><small>${hasCaps ? "Instant and free. Less accurate, no speakers." : "This video has no captions."}</small></span></label>
+    </div>` : ""}
+    <div class="lp-foot"><span class="hint">${!d.youtube && est != null ? `About ${money(est)} with Deepgram.` : ""}</span>
+      <button class="btn sm" type="button" data-a="cancel">Cancel</button><button class="btn sm primary" type="button" data-a="go">Transcribe</button></div>
+  </div>`);
+  const box = $("linkPreview");
+  box.querySelector('[data-a="open"]').onclick = () => openExternal(i.url || p.url);
+  box.querySelector('[data-a="chan"]')?.addEventListener("click", () => openExternal(i.uploaderUrl));
+  box.querySelector('[data-a="desc"]')?.addEventListener("click", (ev) => { const dd = box.querySelector(".lp-desc"); dd.hidden = !dd.hidden; ev.target.textContent = dd.hidden ? "Show description" : "Hide description"; });
+  box.querySelectorAll("input[name=ytm]").forEach((r) => r.onchange = () => setPref("ytMode", r.value));
+  box.querySelector('[data-a="cancel"]').onclick = () => { cancelPreview(); };
+  box.querySelector('[data-a="go"]').onclick = () => {
+    const captions = !!d.youtube && box.querySelector("input[name=ytm]:checked")?.value === "captions";
+    if (!captions && needKey()) return;
+    jobs.push({ kind: "url", id: newId32(), name: i.title || "Linked recording", url: p.url, thumb: i.thumbnail,
+      sub: [i.uploader, i.duration ? clock(i.duration) : null, i.site].filter(Boolean).join(", "),
+      estimate: captions ? null : est, opts: { ...currentOpts(), captions }, status: "waiting", pct: 0 });
+    $("linkIn").value = ""; preview = null; setPreview("");
+    renderJobs(); pump();
+  };
+}
 
 /* Web video support: yt-dlp + QuickJS, downloaded on first use */
 function ensureAddon() {
@@ -417,9 +489,11 @@ function renderJobs() {
     if (job.status === "processing") { state = `Transcribing, ${clock((Date.now() - (job.t0 || Date.now())) / 1000)}${est}`; bar = `<div class="bar indet"><i></i></div>`; }
     if (job.status === "waiting" && est) state += est;
     if (job.status === "error") state = job.err;
-    el.innerHTML = `<div class="job-top"><div class="job-name" title="${esc(job.name)}">${esc(job.name)}</div>
+    el.innerHTML = `<div class="job-row">${job.thumb ? `<img class="job-thumb" src="${esc(job.thumb)}" alt="" referrerpolicy="no-referrer">` : ""}<div>
+      <div class="job-top"><div class="job-name" title="${esc(job.name)}">${esc(job.name)}</div>
       <button class="icon-btn" data-a="x" title="${job.status === "error" ? "Dismiss" : "Cancel"}">${ICON.x}</button></div>
-      <div class="job-state ${job.status === "error" ? "err" : ""}">${esc(state)}</div>${bar}
+      ${job.sub ? `<div class="job-sub">${esc(job.sub)}</div>` : ""}
+      <div class="job-state ${job.status === "error" ? "err" : ""}">${esc(state)}</div></div></div>${bar}
       ${job.status === "error" ? `<div class="job-actions">${job.needsAddon ? `<button class="link-btn" data-a="addon">Add web video support</button>` : ""}<button class="link-btn" data-a="retry">Try again</button></div>` : ""}`;
     el.querySelector('[data-a="x"]').onclick = () => cancelJob(job);
     el.querySelector('[data-a="addon"]')?.addEventListener("click", async () => {
@@ -515,7 +589,7 @@ function renderLibrary() {
   for (const m of items) {
     const b = document.createElement("button");
     b.className = "item" + (!selecting && doc && doc.id === m.id ? " on" : "");
-    const sub = [when(m.created), m.duration ? clock(m.duration) : null].filter(Boolean).join(", ");
+    const sub = [when(m.created), m.duration ? clock(m.duration) : null, m.site || null].filter(Boolean).join(", ");
     b.innerHTML = (selecting ? `<input type="checkbox" tabindex="-1" ${selected.has(m.id) ? "checked" : ""}>` : "") +
       `<div><div class="item-title">${esc(m.title)}</div><div class="item-sub">${esc(sub)}</div>` +
       (m.snippet ? `<div class="item-snip">${highlightSnippet(m.snippet, searchQ)}</div>` : "") + `</div>`;
@@ -577,6 +651,7 @@ async function openDoc(id, preloaded) {
   renderMeta();
   $("summary").hidden = !doc.summary;
   $("summaryText").textContent = doc.summary || "";
+  renderSource();
   renderSpeakers();
   renderSegments();
   $("saveState").textContent = "";
@@ -622,6 +697,31 @@ function setTab(t) {
 }
 document.querySelectorAll(".tab").forEach((b) => b.onclick = () => setTab(b.dataset.tab));
 
+function renderSource() {
+  const box = $("sourceCard");
+  const i = doc.sourceInfo;
+  if (!i && !doc.sourceUrl) { box.hidden = true; return; }
+  const url = (i && i.url) || doc.sourceUrl;
+  const meta = [];
+  if (i?.uploader) meta.push(`<b>${esc(i.uploader)}</b>`);
+  if (i?.duration) meta.push(esc(clock(i.duration)));
+  if (i?.date) meta.push("Uploaded " + esc(fmtDate(i.date)));
+  if (i?.views != null) meta.push(esc(fmtViews(i.views)));
+  meta.push(esc(doc.source?.startsWith("YouTube captions") ? "Text from YouTube's captions" : (i?.site || doc.source || "Link")));
+  box.hidden = false;
+  box.innerHTML = `${doc.thumb ? `<img src="/thumb/${doc.id}" alt="">` : ""}
+    <div class="lp-body"><div class="lp-title">${esc(i?.title || doc.title)}</div>
+      <div class="lp-meta">${meta.map((m) => `<span>${m}</span>`).join("")}</div>
+      <div class="lp-links"><button class="link-btn" data-a="open">Open ${esc(i?.site && i.site.length < 14 ? "on " + i.site : "link")}</button>
+        <button class="link-btn" data-a="copy">Copy link</button>
+        ${i?.uploaderUrl ? `<button class="link-btn" data-a="chan">Open channel</button>` : ""}
+        ${i?.description ? `<button class="link-btn" data-a="desc">Show description</button>` : ""}</div>
+      ${i?.description ? `<div class="lp-desc" hidden>${esc(i.description)}</div>` : ""}</div>`;
+  box.querySelector('[data-a="open"]').onclick = () => openExternal(url);
+  box.querySelector('[data-a="copy"]').onclick = async () => { try { await navigator.clipboard.writeText(url); toast("Link copied"); } catch { toast("Couldn't copy the link."); } };
+  box.querySelector('[data-a="chan"]')?.addEventListener("click", () => openExternal(i.uploaderUrl));
+  box.querySelector('[data-a="desc"]')?.addEventListener("click", (ev) => { const dd = box.querySelector(".lp-desc"); dd.hidden = !dd.hidden; ev.target.textContent = dd.hidden ? "Show description" : "Hide description"; });
+}
 function speakerLabel(sp) { return sp == null ? null : (doc.speakers[String(sp)] || `Speaker ${+sp + 1}`); }
 function renderSpeakers() {
   const keys = Object.keys(doc.speakers || {});
@@ -1222,7 +1322,9 @@ async function openSettings(focus) {
         ${models.map((m, i) => `<option value="${m}">${m}${i === 0 ? " (fastest, cheapest)" : " (more thorough)"}</option>`).join("")}</select></div></section>
     <section><h3>Web video support</h3>
       <p class="hint" id="addonInfo">Checking…</p>
-      <div class="row" id="addonBtns"></div></section>
+      <div class="row" id="addonBtns"></div>
+      <label class="switch" style="margin-top:8px"><input type="checkbox" id="sFirefox" ${prefs.firefoxCookies ? "checked" : ""} ${status.firefox ? "" : "disabled"}><span><b>Use my Firefox sign-in for videos that need it</b>
+        <small>${status.firefox ? "For Facebook, Instagram and other sites that only show some videos to signed-in people. Transcriber uses the sign-in only to fetch the video, on this computer. Never used for YouTube." : "Firefox isn't installed on this computer. Chrome and Edge keep their sign-ins locked, so only Firefox works for this."}</small></span></label></section>
     <section><h3>Updates</h3>
       <label class="switch"><input type="checkbox" id="sAuto" ${prefs.autoUpdate ? "checked" : ""}><span><b>Check for updates when Transcriber opens</b></span></label>
       <div class="row"><button class="btn" id="sCheck">Check now</button><span class="hint">You have version ${esc(status.version || "")}.</span></div></section>
@@ -1258,6 +1360,7 @@ async function openSettings(focus) {
       d.querySelector("#gKeyDel")?.addEventListener("click", async () => { await req("DELETE", "/api/key?kind=gemini"); status.hasGemini = false; toast("Gemini key removed"); openSettings(); if (doc && tab === "writeups") renderWriteups(); });
       const gm = d.querySelector("#gModel"); gm.value = prefs.geminiModel || models[0] || ""; gm.onchange = () => setPref("geminiModel", gm.value);
       d.querySelector("#sAuto").onchange = (e) => setPref("autoUpdate", e.target.checked);
+      d.querySelector("#sFirefox").onchange = (e) => setPref("firefoxCookies", e.target.checked);
       d.querySelector("#sCheck").onclick = () => checkUpdates(true);
       d.querySelector("#sOpen")?.addEventListener("click", () => desktop().open_library());
       if (focus === "gemini") d.querySelector("#gKey").focus();
